@@ -4,15 +4,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <arpa/inet.h>
+#include <errno.h>
 
 #include <getopt.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <sys/socket.h>
 #include <sys/types.h>
-#include "pthread.h"
+#include <pthread.h>
 
-#include "MultModuloCommon.h" 
+#include "MultModuloCommon.h"
 
 struct FactorialArgs {
   uint64_t begin;
@@ -33,6 +35,17 @@ uint64_t Factorial(const struct FactorialArgs *args) {
 void *ThreadFactorial(void *args) {
   struct FactorialArgs *fargs = (struct FactorialArgs *)args;
   return (void *)(uint64_t *)Factorial(fargs);
+}
+
+void print_network_info(int port) {
+    char hostname[256];
+    gethostname(hostname, sizeof(hostname));
+    printf("=== Server Network Information ===\n");
+    printf("Server hostname: %s\n", hostname);
+    printf("Server listening on port: %d\n", port);
+    printf("Server IP: 0.0.0.0 (all network interfaces)\n");
+    printf("Clients can connect using your computer's IP address\n");
+    printf("==================================\n");
 }
 
 int main(int argc, char **argv) {
@@ -57,9 +70,17 @@ int main(int argc, char **argv) {
       switch (option_index) {
       case 0:
         port = atoi(optarg);
+        if (port <= 0 || port > 65535) {
+          fprintf(stderr, "Invalid port number: %d. Port must be between 1 and 65535\n", port);
+          return 1;
+        }
         break;
       case 1:
         tnum = atoi(optarg);
+        if (tnum <= 0) {
+          fprintf(stderr, "Invalid thread number: %d. Must be positive\n", tnum);
+          return 1;
+        }
         break;
       default:
         printf("Index %d is out of options\n", option_index);
@@ -81,31 +102,36 @@ int main(int argc, char **argv) {
 
   int server_fd = socket(AF_INET, SOCK_STREAM, 0);
   if (server_fd < 0) {
-    fprintf(stderr, "Can not create server socket!");
+    fprintf(stderr, "Can not create server socket! Error: %s\n", strerror(errno));
     return 1;
   }
 
   struct sockaddr_in server;
   server.sin_family = AF_INET;
   server.sin_port = htons((uint16_t)port);
-  server.sin_addr.s_addr = htonl(INADDR_ANY);
+  server.sin_addr.s_addr = htonl(INADDR_ANY); // Принимаем соединения с любых IP
 
   int opt_val = 1;
   setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt_val, sizeof(opt_val));
 
   int err = bind(server_fd, (struct sockaddr *)&server, sizeof(server));
   if (err < 0) {
-    fprintf(stderr, "Не удается привязаться к сокету!");
+    fprintf(stderr, "Cannot bind to socket! Error: %s\n", strerror(errno));
+    fprintf(stderr, "Make sure port %d is available and not used by another program\n", port);
+    close(server_fd);
     return 1;
   }
 
   err = listen(server_fd, 128);
   if (err < 0) {
-    fprintf(stderr, "Не удалось прослушать сокет\n");
+    fprintf(stderr, "Cannot listen on socket! Error: %s\n", strerror(errno));
+    close(server_fd);
     return 1;
   }
 
-  printf("Server listening at %d\n", port);
+  print_network_info(port);
+  printf("Server is ready for connections...\n");
+  printf("To connect from another computer, use your IP address and port %d\n", port);
 
   while (true) {
     struct sockaddr_in client;
@@ -113,23 +139,29 @@ int main(int argc, char **argv) {
     int client_fd = accept(server_fd, (struct sockaddr *)&client, &client_len);
 
     if (client_fd < 0) {
-      fprintf(stderr, "Не удалось установить новое соединение\n");
+      fprintf(stderr, "Failed to accept new connection\n");
       continue;
     }
+
+    char client_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &client.sin_addr, client_ip, INET_ADDRSTRLEN);
+    printf("New connection from: %s:%d\n", client_ip, ntohs(client.sin_port));
 
     while (true) {
       unsigned int buffer_size = sizeof(uint64_t) * 3;
       char from_client[buffer_size];
-      int read = recv(client_fd, from_client, buffer_size, 0);
+      int read_bytes = recv(client_fd, from_client, buffer_size, 0);
 
-      if (!read)
-        break;
-      if (read < 0) {
-        fprintf(stderr, "Не удалось выполнить чтение клиента\n");
+      if (read_bytes == 0) {
+        printf("Client %s:%d disconnected\n", client_ip, ntohs(client.sin_port));
         break;
       }
-      if (read < buffer_size) {
-        fprintf(stderr, "Клиент отправляет неправильный формат данных\n");
+      if (read_bytes < 0) {
+        fprintf(stderr, "Failed to read from client\n");
+        break;
+      }
+      if (read_bytes < buffer_size) {
+        fprintf(stderr, "Client sends wrong data format\n");
         break;
       }
 
@@ -142,7 +174,7 @@ int main(int argc, char **argv) {
       memcpy(&end, from_client + sizeof(uint64_t), sizeof(uint64_t));
       memcpy(&mod, from_client + 2 * sizeof(uint64_t), sizeof(uint64_t));
 
-      fprintf(stdout, "Получено: %lu %lu %lu\n", begin, end, mod);
+      fprintf(stdout, "Received from %s: %lu %lu %lu\n", client_ip, begin, end, mod);
 
       struct FactorialArgs args[tnum];
       uint64_t part = (end - begin + 1) / tnum;
@@ -156,8 +188,9 @@ int main(int argc, char **argv) {
         current = args[i].end + 1;
 
         if (pthread_create(&threads[i], NULL, ThreadFactorial, (void *)&args[i])) {
-          printf("Error: pthread_create failed!\n");
-          return 1;
+          fprintf(stderr, "Error: pthread_create failed!\n");
+          close(client_fd);
+          break;
         }
       }
 
@@ -168,13 +201,13 @@ int main(int argc, char **argv) {
         total = MultModulo(total, result, mod);
       }
 
-      printf("Итог: %lu\n", total);
+      printf("Total for %s: %lu\n", client_ip, total);
 
       char buffer[sizeof(total)];
       memcpy(buffer, &total, sizeof(total));
       err = send(client_fd, buffer, sizeof(total), 0);
       if (err < 0) {
-        fprintf(stderr, "Не удается отправить данные клиенту\n");
+        fprintf(stderr, "Cannot send data to client\n");
         break;
       }
     }
@@ -183,5 +216,6 @@ int main(int argc, char **argv) {
     close(client_fd);
   }
 
+  close(server_fd);
   return 0;
 }
